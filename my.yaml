@@ -1,0 +1,18 @@
+# ================= 配置中心 =================
+# 注意：YAML中路径建议使用正斜杠 /，或者双反斜杠 \\
+# ===========================================
+
+# 输入文件夹路径
+input_folder: "C:/Users/Admin/Desktop/SourceData"
+
+# 输出文件夹路径
+output_folder: "C:/Users/Admin/Desktop/ResultData"
+
+# 目标文件后缀 (留空则处理所有)
+target_extension: ".txt"
+
+# 是否打印详细日志 (true/false)
+debug_mode: true
+
+# 结果文件名
+result_filename: "final_report.txt"

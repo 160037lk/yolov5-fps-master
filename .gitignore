@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+.idea/
+.vscode/
+.claude/
+*.log
+gui_output.log
+gui_test.log
+yolov5-fps-master.zip
+.worktrees/
+worktrees/
