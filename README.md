@@ -1,10 +1,10 @@
-# YOLOv5 FPS Auto-Aim System
+# OBS Auto Aim — 基于 YOLOv5 的 OBS 实时自瞄系统
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)]()
 
-A real-time FPS game auto-aim tool based on YOLOv5. Supports TensorRT / ONNX / PyTorch backends, OBS Virtual Camera input, and Logitech mouse control.
+An OBS-based real-time FPS auto-aim system powered by YOLOv5. TensorRT / ONNX / PyTorch backends, OBS Virtual Camera input, Logitech mouse control.
 
 > English · [中文说明](#-功能说明)
 
