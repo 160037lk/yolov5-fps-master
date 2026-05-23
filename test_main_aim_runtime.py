@@ -22,13 +22,12 @@ def test_main_reaches_capture_init_with_only_obs_camera_index(monkeypatch):
     )
 
     class DummyCapture:
-        def __init__(self, target_fps, obs_camera_index):
-            capture_calls["target_fps"] = target_fps
-            capture_calls["obs_camera_index"] = obs_camera_index
-            self.obs_capture = object()
+        def __init__(self, camera_index=0, width=None, height=None):
+            capture_calls["camera_index"] = camera_index
+            self.cap = object()
             raise StopAfterCaptureInit
 
-    monkeypatch.setattr(main_aim, "ScreenCapture", DummyCapture)
+    monkeypatch.setattr(main_aim, "OBSCapture", DummyCapture)
     monkeypatch.setattr(main_aim.cv2, "namedWindow", lambda *args, **kwargs: None)
     monkeypatch.setattr(main_aim.cv2, "resizeWindow", lambda *args, **kwargs: None)
     monkeypatch.setattr(main_aim.cv2, "setWindowProperty", lambda *args, **kwargs: None)
@@ -39,6 +38,5 @@ def test_main_reaches_capture_init_with_only_obs_camera_index(monkeypatch):
         main_aim.main()
 
     assert capture_calls == {
-        "target_fps": main_aim.DXCAM_MAX_FPS,
-        "obs_camera_index": 7,
+        "camera_index": 7,
     }

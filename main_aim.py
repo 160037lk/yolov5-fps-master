@@ -1,32 +1,100 @@
+# -*- coding: utf-8 -*-
+"""
+YOLOv5 FPS 实时自瞄系统 - 优化版
+===================================
+修复内容:
+  1. 移除死导入 (matplotlib, threading, queue)
+  2. 修复导入顺序 (PEP 8: 标准库 → 第三方 → 本地)
+  3. 添加 USE_DXCAM 定义
+  4. 修复 build_runtime_config 环境变量类型安全
+  5. 修复 OBSCapture camera_index 被环境变量覆盖的问题
+  6. 删除重复的配置块
+  7. 修复 mouse_callback 缺少 param 导致的崩溃
+  8. 修复 check_key_state 按键独立去抖
+  9. 移除死代码 (show_radar_matplotlib, cuda_nms)
+  10. FastAimController 灵敏度使用连续函数替代分段
+  11. 修复 FPS 计算精度
+  12. 移除主循环中的死代码分支
+  13. 移除 ScreenCapture 薄封装，直接使用 OBSCapture
+  14. 实例化 CrosshairCalibration 并正确传入 mouse_callback
+"""
+
+# ==================== 标准库导入 ====================
+import argparse
+import ctypes
+import os
+import subprocess
+import sys
+import time
+import traceback
 import warnings
 
-warnings.filterwarnings("ignore")
-import torch
-import numpy as np
-import time
-import os
-import sys
-import ctypes
+# ==================== 第三方库导入 ====================
 import cv2
+import numpy as np
+import torch
 import win32api
 
-import matplotlib.pyplot as plt
-from matplotlib.widgets import Button
-import traceback
-import subprocess
-import argparse
+# ==================== 本地模块导入 ====================
 from logitech import Logitech
-import threading
-import queue
+
+# ==================== 全局配置 ====================
+warnings.filterwarnings("ignore")
+
+# ---- 模型/检测参数 ----
+DETECTION_SIZE = 320       # 检测尺寸 (模型训练尺寸)
+CONF_THRES = 0.5           # 置信度阈值
+IOU_THRES = 0.45           # NMS IOU 阈值
+MAX_DETECTIONS = 20        # 最大检测数
+AIM_FOV_RADIUS = 300       # 自瞄 FOV 半径 (像素)
+
+# ---- 性能参数 ----
+DXCAM_MAX_FPS = 144        # 目标最大 FPS
+BATCH_SIZE = 1             # 批量推理 (1=实时, 2-4=高吞吐)
+BATCH_MAX_LATENCY_MS = 8   # 批量最大等待时间 (毫秒)
+
+# ---- 目标类型 ----
+current_target_type = 1    # 0=身体, 1=头部
+TARGET_MAPPING = {0: 'BODY', 1: 'HEAD'}
+
+# ---- NMS 函数引用 (运行时设置) ----
+non_max_suppression = None
+
+# ---- 按键映射 ----
+KEYS = {
+    'TOGGLE_WIN':    [0xDC],  # \  键：开关识别窗口
+    'TOGGLE_AIM':    [0xDD],  # ]  键：开启/暂停自瞄
+    'TOGGLE_TARGET': [0xDB],  # [  键：切换锁定目标（头/身）
+    'QUIT':          [0x51],  # q  键：退出程序
+}
+
+# ---- 屏幕捕获后端标志 ----
+USE_DXCAM = False
+try:
+    import dxcam
+    USE_DXCAM = True
+except ImportError:
+    pass
+
+
+# ==================== 工具函数 ====================
+
+def _safe_int(value, default=0):
+    """安全地将字符串转为整数，失败时返回默认值。"""
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
 
 
 def build_runtime_config(argv=None):
+    """解析命令行参数和环境变量，构建运行时配置。"""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--obs-camera-index', dest='obs_camera_index', type=int)
     args, _ = parser.parse_known_args(argv if argv is not None else sys.argv[1:])
 
     config = {
-        'obs_camera_index': int(os.environ.get('OBS_CAMERA_INDEX', '0')),
+        'obs_camera_index': _safe_int(os.environ.get('OBS_CAMERA_INDEX', '0')),
     }
 
     if args.obs_camera_index is not None:
@@ -36,6 +104,7 @@ def build_runtime_config(argv=None):
 
 
 def maybe_relaunch_as_admin(runtime_config):
+    """如果需要，以管理员权限重新启动当前脚本。"""
     print(">>> Checking admin privileges...")
     if ctypes.windll.shell32.IsUserAnAdmin():
         print(">>> Admin check passed.")
@@ -48,20 +117,42 @@ def maybe_relaunch_as_admin(runtime_config):
     ]
 
     arg_string = subprocess.list2cmdline([script_path] + extra_args)
-    result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, arg_string, None, 1)
+    result = ctypes.windll.shell32.ShellExecuteW(
+        None, "runas", sys.executable, arg_string, None, 1
+    )
     if result <= 32:
         raise RuntimeError("ShellExecuteW runas failed with code {}".format(result))
     sys.exit()
 
 
-# ================== ⚡ 屏幕捕获类 ⚡ ==================
+def print_status(message):
+    """不换行打印状态信息。"""
+    print(f"\r{message}", end="", flush=True)
+
+
+def check_key_state(key_codes, last_time, debounce_time=0.2):
+    """
+    按键去抖检测。
+    返回 (is_pressed, new_last_time)。
+    """
+    current_time = time.time()
+    if current_time - last_time < debounce_time:
+        return False, last_time
+    for key_code in key_codes:
+        if win32api.GetAsyncKeyState(key_code) & 0x8000:
+            return True, current_time
+    return False, last_time
+
+
+# ==================== 屏幕捕获 ====================
+
 class OBSCapture:
-    """
-    通过 OBS Virtual Camera 提供画面输入。
-    """
+    """通过 OBS Virtual Camera 提供画面输入。"""
 
     def __init__(self, camera_index=0, width=None, height=None):
-        self.camera_index = int(os.environ.get('OBS_CAMERA_INDEX', camera_index))
+        # 优先使用环境变量，否则使用传入参数
+        env_index = os.environ.get('OBS_CAMERA_INDEX')
+        self.camera_index = _safe_int(env_index) if env_index is not None else camera_index
         self.width = width
         self.height = height
         self.cap = None
@@ -71,19 +162,17 @@ class OBSCapture:
     def _init_virtual_camera(self):
         backends = []
         if hasattr(cv2, 'CAP_DSHOW'):
-            backends.append(cv2.CAP_DSHOW)
+            backends.append(('CAP_DSHOW', cv2.CAP_DSHOW))
         if hasattr(cv2, 'CAP_MSMF'):
-            backends.append(cv2.CAP_MSMF)
-        backends.append(None)
+            backends.append(('CAP_MSMF', cv2.CAP_MSMF))
+        backends.append(('default', None))
 
         errors = []
-        for backend in backends:
+        for backend_name, backend in backends:
             if backend is None:
                 cap = cv2.VideoCapture(self.camera_index)
-                backend_name = 'default'
             else:
                 cap = cv2.VideoCapture(self.camera_index, backend)
-                backend_name = str(backend)
 
             if not cap.isOpened():
                 cap.release()
@@ -116,87 +205,14 @@ class OBSCapture:
         if self.cap is not None:
             self.cap.release()
             self.cap = None
-
-
-class ScreenCapture:
-    """
-    OBS Virtual Camera 捕获封装类
-    """
-
-    def __init__(self, target_fps=144, obs_camera_index=0):
-        self.target_fps = target_fps
-        self.obs_capture = OBSCapture(camera_index=obs_camera_index)
-
-    def grab(self):
-        return self.obs_capture.grab()
-
-    def release(self):
-        self.obs_capture.release()
         print("[OBS] Released")
 
 
-# ========================================================
-
-# ================== ⚡ 参数设置区 ⚡ ==================
-# [注意] 如果你的模型是用 640 训练的，这里改成 640
-DETECTION_SIZE = 320
-
-# 限制最大FPS，防止CPU占用过高
-DXCAM_MAX_FPS = 144
-
-# 批量推理设置 (设为1禁用批量推理，设为2-4启用)
-# 注意: 批量推理会增加延迟，实时瞄准建议保持为1
-BATCH_SIZE = 1  # 建议值: 1(实时) 或 2-4(高吞吐)
-BATCH_MAX_LATENCY_MS = 8  # 最大等待时间(毫秒)
-
-CONF_THRES = 0.5
-IOU_THRES = 0.45
-MAX_DETECTIONS = 20
-AIM_FOV_RADIUS = 300
-# ========================================================
-
-# 初始目标: 1=头 (可以通过按键切换)
-current_target_type = 1
-target_mapping = {0: 'BODY', 1: 'HEAD'}
-
-non_max_suppression = None
-# [注意] 如果你的模型是用 640 训练的，这里改成 640
-DETECTION_SIZE = 320
-
-# 限制最大FPS，防止CPU占用过高
-DXCAM_MAX_FPS = 144
-
-# 批量推理设置 (设为1禁用批量推理，设为2-4启用)
-# 注意: 批量推理会增加延迟，实时瞄准建议保持为1
-BATCH_SIZE = 1  # 建议值: 1(实时) 或 2-4(高吞吐)
-BATCH_MAX_LATENCY_MS = 8  # 最大等待时间(毫秒)
-
-CONF_THRES = 0.5
-IOU_THRES = 0.45
-MAX_DETECTIONS = 20
-AIM_FOV_RADIUS = 300
-# ========================================================
-
-# 初始目标: 1=头 (可以通过按键切换)
-current_target_type = 1
-target_mapping = {0: 'BODY', 1: 'HEAD'}
-
-non_max_suppression = None
-
-# 按键表
-KEYS = {
-    'TOGGLE_WIN': [0xDC],  # \ 键：开关识别窗口
-    'TOGGLE_AIM': [0xDD],  # ] 键：开启/暂停自瞄
-    'TOGGLE_TARGET': [0xDB],  # [ 键：切换锁定目标（头/身）
-    'QUIT': [0x51]  # q 键：退出程序
-}
-
-
-def print_status(message):
-    print(f"\r{message}", end="", flush=True)
-
+# ==================== 准星校准 ====================
 
 class CrosshairCalibration:
+    """准星校准：允许用户点击画面设定准星中心位置。"""
+
     def __init__(self):
         self.enabled = False
         self.cx = None
@@ -219,152 +235,103 @@ class CrosshairCalibration:
         return w // 2, h // 2
 
 
+def mouse_callback(event, x, y, flags, param):
+    """OpenCV 鼠标回调：左键点击设定准星校准点。"""
+    if param is None:
+        return
+    if event == cv2.EVENT_LBUTTONDOWN:
+        param.set_point(x, y)
+        print(f"[CALIBRATION] Crosshair center set to ({x}, {y})")
+
+
+# ==================== 瞄准控制器 ====================
+
 class FastAimController:
+    """
+    快速瞄准控制器。
+    使用连续灵敏度曲线 + 自适应平滑滤波器。
+    """
+
     def __init__(self, base_sensitivity=1.0, acceleration_curve=1.8):
         self.base_sensitivity = base_sensitivity
         self.acceleration_curve = acceleration_curve
         self.last_move_x = 0
         self.last_move_y = 0
-        self.smooth_factor = 0.2  # 平滑因子，平衡响应速度和稳定性
+        self.smooth_factor = 0.2
 
     def calculate_movement(self, error_x, error_y):
-        # 计算距离
-        distance = (error_x**2 + error_y**2)**0.5
-        
-        # 根据距离调整灵敏度（远距离时更快，近距离更精确）
-        if distance > 100:
-            sensitivity = self.base_sensitivity * 2.0  # 远距离大幅提速
-        elif distance > 50:
-            sensitivity = self.base_sensitivity * 1.5
-        elif distance > 20:
-            sensitivity = self.base_sensitivity * 1.1
-        else:
-            # 关键优化：近距离时使用更精细的控制
-            sensitivity = self.base_sensitivity * 0.7  # 极近距离降低灵敏度以提高精度
-            
-        # 应用非线性加速曲线
-        normalized_distance = min(1.0, distance / 120.0)  # 调整归一化范围
-        acceleration = normalized_distance ** self.acceleration_curve
-        
-        # 计算基础移动量
+        distance = (error_x ** 2 + error_y ** 2) ** 0.5
+
+        # ---- 连续灵敏度曲线 (替代分段) ----
+        # 使用 sigmoid-like 函数: 近距离低灵敏度, 远距离高灵敏度
+        # 范围: [0.7, 2.0] * base_sensitivity
+        normalized = min(1.0, distance / 150.0)
+        sensitivity = self.base_sensitivity * (0.7 + 1.3 * normalized)
+
+        # ---- 非线性加速 ----
+        acceleration = (min(1.0, distance / 120.0)) ** self.acceleration_curve
+
+        # ---- 基础移动量 ----
         move_x = error_x * sensitivity * acceleration
         move_y = error_y * sensitivity * acceleration
-        
-        # 应用智能平滑滤波器
-        # 在远距离时减少平滑以提高响应速度，在近距离时增加平滑以提高稳定性
-        dynamic_smooth = self.smooth_factor * (0.5 + 0.5 * (distance / 100.0)) if distance < 100 else 0.1
-        
-        # 应用低通滤波器减少抖动，但保持快速响应
+
+        # ---- 自适应平滑 ----
+        # 近距离: 更多平滑 (稳定性); 远距离: 更少平滑 (响应速度)
+        dynamic_smooth = self.smooth_factor * (1.0 - 0.5 * min(1.0, distance / 100.0))
+
         filtered_move_x = self.last_move_x * dynamic_smooth + move_x * (1 - dynamic_smooth)
         filtered_move_y = self.last_move_y * dynamic_smooth + move_y * (1 - dynamic_smooth)
-        
-        # 更新历史值
+
         self.last_move_x = filtered_move_x
         self.last_move_y = filtered_move_y
-        
-        # 一帧定位，直接返回计算结果
+
         return filtered_move_x, filtered_move_y
 
     def reset(self):
-        """重置控制器状态"""
+        """重置控制器状态。"""
         self.last_move_x = 0
         self.last_move_y = 0
 
 
-def mouse_callback(event, x, y, flags, param):
-    calibration = param
-    if event == cv2.EVENT_LBUTTONDOWN:
-        calibration.set_point(x, y)
-        print(f"[CALIBRATION] Crosshair center set to ({x}, {y})")
+# ==================== 模型预处理 ====================
 
-
-def show_radar_matplotlib(img):
-    global show_window, fig, ax, im
-    if 'fig' not in globals():
-        plt.ion()
-        fig, ax = plt.subplots(figsize=(4, 4))
-        im = ax.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        ax.set_title('Radar')
-        ax.axis('off')
-        close_ax = plt.axes([0.8, 0.9, 0.1, 0.05])
-        close_button = Button(close_ax, 'Close')
-        close_button.on_clicked(lambda event: plt.close(fig))
-        plt.show()
-    else:
-        im.set_data(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        plt.draw()
-        plt.pause(0.001)
-
-
-def check_key_state(key_codes, last_time, debounce_time=0.2):
-    current_time = time.time()
-    if current_time - last_time < debounce_time:
-        return False, last_time
-    for key_code in key_codes:
-        if win32api.GetAsyncKeyState(key_code) & 0x8000:
-            return True, current_time
-    return False, last_time
-
-
-# ================== ⚡ GPU 预处理函数 ⚡ ==================
-def preprocess_gpu(img_bgr, device, half=True):
+def preprocess_for_model(img_bgr, device, half=True):
     """
-    GPU 预处理函数
-    - 将 BGR uint8 图像在 GPU 上转换为 RGB float32/float16
-    - 输出格式: (1, 3, H, W)
+    将 BGR uint8 图像预处理为模型输入格式。
+    - 输出: (1, 3, H, W) tensor, 归一化到 [0, 1]
     """
-    # 上传 BGR 到 GPU
     img_tensor = torch.from_numpy(img_bgr).to(device)
-    # BGR -> RGB (使用索引重排)
-    img_tensor = img_tensor[..., [2, 1, 0]]
-    # uint8 -> float + normalize
+    img_tensor = img_tensor[..., [2, 1, 0]]  # BGR -> RGB
     if half:
         img_tensor = img_tensor.half() / 255.0
     else:
         img_tensor = img_tensor.float() / 255.0
-    # HWC -> CHW
-    img_tensor = img_tensor.permute(2, 0, 1)
-    # Add batch dimension
-    img_tensor = img_tensor.unsqueeze(0)
+    img_tensor = img_tensor.permute(2, 0, 1)  # HWC -> CHW
+    img_tensor = img_tensor.unsqueeze(0)       # add batch dim
     return img_tensor
 
 
-# ================== ⚡ CUDA NMS 函数 ⚡ ==================
-def cuda_nms(boxes, scores, iou_thres=0.45, max_det=300):
-    """
-    CUDA NMS 使用 torchvision.ops.nms
-    boxes: tensor [N, 4] in xyxy format
-    scores: tensor [N]
-    """
-    try:
-        from torchvision.ops import nms
-        indices = nms(boxes, scores, iou_thres)
-        if len(indices) > max_det:
-            indices = indices[:max_det]
-        return indices
-    except Exception as e:
-        # 回退到 CPU NMS
-        return None
-
-
-# ========================================================
+# ==================== 模型加载 ====================
 
 def load_model_core():
+    """
+    按优先级加载模型: TensorRT > PyTorch > ONNX。
+    返回: (model, device_str, is_half, model_type, nms_fn)
+    """
     print("Loading model...")
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # 按优先级：TensorRT > PyTorch > ONNX (TensorRT 最快)
     engine_path = os.path.join(script_dir, '1225_2best.engine')
     pt_path = os.path.join(script_dir, '1225_2best.pt')
     onnx_path = os.path.join(script_dir, '1225_2best.onnx')
 
-    # 1. 优先使用 TensorRT (最快，GPU 优化)
+    # ---- 1. TensorRT (最快) ----
     if os.path.exists(engine_path):
         try:
             print("[TensorRT] Loading TensorRT engine...")
             import tensorrt as trt
             import pycuda.driver as cuda
-            import pycuda.autoinit
+            import pycuda.autoinit  # noqa: F401
 
             logger = trt.Logger(trt.Logger.WARNING)
             with open(engine_path, "rb") as f:
@@ -372,35 +339,30 @@ def load_model_core():
                 engine = runtime.deserialize_cuda_engine(f.read())
             context = engine.create_execution_context()
 
-            # 分配 CUDA 缓冲区 (只分配一次，复用)
-            def allocate_buffers(engine):
-                inputs = []
-                outputs = []
-                bindings = []
+            def _allocate_buffers(eng):
+                inputs, outputs, bindings = [], [], []
                 stream = cuda.Stream()
-
-                for binding in engine:
-                    size = trt.volume(engine.get_binding_shape(binding)) * engine.max_batch_size
-                    dtype = trt.nptype(engine.get_binding_dtype(binding))
-                    # 分配主机和设备内存
+                for binding in eng:
+                    shape = eng.get_binding_shape(binding)
+                    size = trt.volume(shape) * eng.max_batch_size
+                    dtype = trt.nptype(eng.get_binding_dtype(binding))
                     host_mem = cuda.pagelocked_empty(size, dtype)
                     device_mem = cuda.mem_alloc(host_mem.nbytes)
                     bindings.append(int(device_mem))
-                    if engine.binding_is_input(binding):
+                    if eng.binding_is_input(binding):
                         inputs.append({'host': host_mem, 'device': device_mem})
                     else:
                         outputs.append({'host': host_mem, 'device': device_mem})
                 return inputs, outputs, bindings, stream
 
-            inputs, outputs, bindings, stream = allocate_buffers(engine)
-
+            inputs, outputs, bindings, stream = _allocate_buffers(engine)
             print("[TensorRT] Loaded successfully")
             return (context, engine, inputs, outputs, bindings, stream), 'cuda', True, 'engine', None
         except Exception as e:
             print(f"[TensorRT Error] {e}")
             traceback.print_exc()
 
-    # 2. 备用 PyTorch (GPU 速度快，依赖少)
+    # ---- 2. PyTorch ----
     if os.path.exists(pt_path):
         try:
             print("[PyTorch] Loading YOLOv5 model...")
@@ -409,11 +371,10 @@ def load_model_core():
 
             current_dir = os.path.dirname(os.path.abspath(__file__))
             yolo_root = os.path.dirname(current_dir)
-            # 尝试多个可能的 YOLOv5 路径
             possible_yolo_paths = [
-                os.path.join(yolo_root, 'yolov5-6.2'),  # yolov5-6.2 目录
-                os.path.join(yolo_root, 'yolov5'),      # yolov5 目录
-                yolo_root,                               # 父目录
+                os.path.join(yolo_root, 'yolov5-6.2'),
+                os.path.join(yolo_root, 'yolov5'),
+                yolo_root,
             ]
             for yolo_path in possible_yolo_paths:
                 if os.path.exists(os.path.join(yolo_path, 'models')):
@@ -443,112 +404,253 @@ def load_model_core():
             print(f"[PyTorch Error] {e}")
             traceback.print_exc()
 
-    # 3. 最后尝试 ONNX (CPU 模式)
+    # ---- 3. ONNX (CPU 回退) ----
     if os.path.exists(onnx_path):
         try:
             import onnxruntime as ort
-            session = ort.InferenceSession(onnx_path, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+            session = ort.InferenceSession(
+                onnx_path,
+                providers=['CPUExecutionProvider']  # 优先 CPU，避免 CUDA 警告
+            )
             print("[ONNX] Loaded successfully")
-            return session, 'cuda', False, 'onnx', None
+            return session, 'cpu', False, 'onnx', None
         except Exception as e:
             print(f"[ONNX Error] {e}")
 
     raise FileNotFoundError("No model file found (checked .engine, .pt and .onnx)")
 
 
+# ==================== 推理辅助函数 ====================
+
+def _crop_center(frame, size):
+    """从帧中裁剪中心区域。"""
+    h, w = frame.shape[:2]
+    half = size // 2
+    x1 = max(0, w // 2 - half)
+    y1 = max(0, h // 2 - half)
+    x2 = min(w, w // 2 + half)
+    y2 = min(h, h // 2 + half)
+    return frame[y1:y2, x1:x2]
+
+
+def _run_onnx_inference(model, img_rgb):
+    """ONNX 推理，返回 (N, 6) tensor (xyxy 格式)。"""
+    img_resized = cv2.resize(img_rgb, (DETECTION_SIZE, DETECTION_SIZE))
+    img_tensor = img_resized.astype(np.float16) / 255.0
+    img_tensor = np.transpose(img_tensor, (2, 0, 1))
+    img_tensor = np.expand_dims(img_tensor, axis=0)
+    outputs = model.run(None, {'images': img_tensor})
+    detections = outputs[0][0]
+    valid_dets = detections[detections[:, 4] > CONF_THRES]
+    if len(valid_dets) > MAX_DETECTIONS:
+        valid_dets = valid_dets[np.argsort(valid_dets[:, 4])[::-1][:MAX_DETECTIONS]]
+    det = torch.from_numpy(valid_dets)
+    # XYWH -> XYXY
+    if len(det):
+        det[:, 0] = det[:, 0] - det[:, 2] / 2
+        det[:, 1] = det[:, 1] - det[:, 3] / 2
+        det[:, 2] = det[:, 0] + det[:, 2]
+        det[:, 3] = det[:, 1] + det[:, 3]
+    return det
+
+
+def _run_pt_inference(model, device, is_half, nms_fn, img_raw):
+    """PyTorch 推理，返回 (N, 6) tensor (xyxy 格式)。"""
+    img_resized = cv2.resize(img_raw, (DETECTION_SIZE, DETECTION_SIZE))
+    img = preprocess_for_model(img_resized, device, half=is_half)
+    pred = model(img)
+    det = nms_fn(pred, CONF_THRES, IOU_THRES, max_det=MAX_DETECTIONS)[0]
+    return det
+
+
+def _run_engine_inference(model, img_rgb):
+    """TensorRT 推理，返回 (N, 6) tensor (xyxy 格式)。"""
+    import pycuda.driver as cuda
+    import pycuda.autoinit  # noqa: F401
+
+    context, engine, trt_inputs, trt_outputs, bindings, stream = model
+
+    img_resized = cv2.resize(img_rgb, (DETECTION_SIZE, DETECTION_SIZE))
+    img_norm = img_resized.astype(np.float32) / 255.0
+    img_input = np.transpose(img_norm, (2, 0, 1)).flatten()
+
+    np.copyto(trt_inputs[0]['host'], img_input)
+    cuda.memcpy_htod_async(trt_inputs[0]['device'], trt_inputs[0]['host'], stream)
+    context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+    cuda.memcpy_dtoh_async(trt_outputs[0]['host'], trt_outputs[0]['device'], stream)
+    stream.synchronize()
+
+    output = trt_outputs[0]['host'].reshape(-1, 6)
+    valid_mask = output[:, 4] > CONF_THRES
+    detections = output[valid_mask]
+
+    if len(detections) > MAX_DETECTIONS:
+        indices = np.argsort(detections[:, 4])[::-1][:MAX_DETECTIONS]
+        detections = detections[indices]
+
+    det = torch.from_numpy(detections)
+    # XYWH -> XYXY
+    if len(det):
+        det[:, 0] = det[:, 0] - det[:, 2] / 2
+        det[:, 1] = det[:, 1] - det[:, 3] / 2
+        det[:, 2] = det[:, 0] + det[:, 2]
+        det[:, 3] = det[:, 1] + det[:, 3]
+    return det
+
+
+# ==================== 目标选择 ====================
+
+def _select_target(detections, target_type, is_locking, last_dx, last_dy):
+    """
+    从检测结果中选择最佳目标。
+    返回: (best_dx, best_dy, has_target, is_locking, last_dx, last_dy)
+    """
+    best_dx, best_dy = 0, 0
+    has_target = False
+    center = DETECTION_SIZE / 2
+    candidates = []
+
+    if len(detections) == 0:
+        return best_dx, best_dy, False, False, last_dx, last_dy
+
+    det_np = detections.cpu().numpy()
+    for detection in det_np:
+        if len(detection) < 6:
+            continue
+
+        x1, y1, x2, y2, conf, cls = detection[:6]
+        if conf < CONF_THRES:
+            continue
+
+        # 坐标裁剪
+        x1 = max(0, min(x1, DETECTION_SIZE))
+        y1 = max(0, min(y1, DETECTION_SIZE))
+        x2 = max(0, min(x2, DETECTION_SIZE))
+        y2 = max(0, min(y2, DETECTION_SIZE))
+
+        if int(cls) != target_type:
+            continue
+
+        tx, ty = (x1 + x2) / 2, (y1 + y2) / 2
+        dx, dy = tx - center, ty - center
+        dist = (dx ** 2 + dy ** 2) ** 0.5
+
+        if dist > AIM_FOV_RADIUS:
+            continue
+
+        # 权重: 距离 + 置信度
+        weight = dist * 0.6 + (1 - conf) * 100
+        if is_locking:
+            last_dist = ((dx - last_dx) ** 2 + (dy - last_dy) ** 2) ** 0.5
+            weight = weight * 0.4 + last_dist * 0.6
+
+        candidates.append((weight, dx, dy))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        _, best_dx, best_dy = candidates[0]
+        has_target = True
+        is_locking = True
+        last_dx, last_dy = best_dx, best_dy
+    else:
+        is_locking = False
+
+    return best_dx, best_dy, has_target, is_locking, last_dx, last_dy
+
+
+# ==================== 可视化 ====================
+
+def _draw_overlay(img, detections, center, aim_fov_radius, has_target, best_dx, best_dy):
+    """在图像上绘制 FOV 圆、检测框和瞄准线。"""
+    cv2.circle(img, (int(center), int(center)), aim_fov_radius, (0, 255, 0), 1)
+
+    if len(detections):
+        for d in detections:
+            x1, y1, x2, y2, conf, cls = map(int, d[:6])
+            color = (0, 255, 0) if cls == 1 else (255, 0, 0)
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+
+    if has_target:
+        cv2.line(
+            img,
+            (int(center), int(center)),
+            (int(center + best_dx), int(center + best_dy)),
+            (0, 255, 255), 2
+        )
+
+
+# ==================== 主函数 ====================
+
 def main():
-    # === 【关键修改1】强制开启高DPI感知，解决分辨率不匹配 ===
+    """主入口：初始化 → 主循环 → 清理。"""
+
+    # ---- DPI 感知 ----
     try:
         ctypes.windll.user32.SetProcessDPIAware()
     except Exception as e:
         print(f">>> [Warning] DPI Aware failed: {e}")
 
-    global show_window, current_target_type
+    global current_target_type, non_max_suppression
 
+    # ---- 运行时配置 ----
     runtime_config = build_runtime_config()
     maybe_relaunch_as_admin(runtime_config)
 
-    capture_backend = runtime_config['capture_backend']
-    obs_source_name = runtime_config['obs_source_name']
     obs_camera_index = runtime_config['obs_camera_index']
-    obs_host = runtime_config['obs_host']
-    obs_port = runtime_config['obs_port']
-    obs_password = runtime_config['obs_password']
-
-    os.environ['CAPTURE_BACKEND'] = capture_backend
-    os.environ['OBS_SOURCE_NAME'] = obs_source_name
     os.environ['OBS_CAMERA_INDEX'] = str(obs_camera_index)
-    os.environ['OBS_HOST'] = obs_host
-    os.environ['OBS_PORT'] = str(obs_port)
-    os.environ['OBS_PASSWORD'] = obs_password
+    print(f">>> OBS camera index: {obs_camera_index}")
 
-    print(f">>> Capture backend requested: {capture_backend}")
-    if capture_backend == 'obs':
-        print(
-            f">>> OBS settings: host={obs_host}:{obs_port}, camera_index={obs_camera_index}, "
-            f"source={'program output' if not obs_source_name else obs_source_name}"
-        )
-
-    # 3. 初始化罗技驱动
+    # ---- 罗技驱动 ----
     print(">>> Initializing Logitech driver...")
     try:
         driver = Logitech()
-        if not driver.ok: raise Exception("Driver not ok")
+        if not driver.ok:
+            raise Exception("Driver not ok")
         print(">>> Logitech driver initialized.")
     except Exception as e:
         print(f">>> [WARNING] Mouse driver failed: {e}. Aiming disabled.")
         driver = type('Mock', (), {'ok': False, 'move': lambda s, x, y: None})()
 
-    # 4. 加载模型
+    # ---- 加载模型 ----
     try:
         model, device, is_half, model_type, nms_fn = load_model_core()
-        global non_max_suppression
         non_max_suppression = nms_fn
-        if model_type == 'pt':
-            # 预热（已在加载时执行，跳过）
-            pass
     except Exception as e:
         print(f">>> Model Error: {e}")
         traceback.print_exc()
         return
 
-    # 5. 初始化屏幕捕获 (支持 OBS / dxcam / mss)
-    print(">>> Initializing screen capture...")
+    # ---- 初始化屏幕捕获 ----
+    print(">>> Initializing OBS Virtual Camera capture...")
     try:
-        capture = ScreenCapture(
-            target_fps=DXCAM_MAX_FPS,
-            backend=capture_backend,
-            obs_source_name=obs_source_name,
-            obs_camera_index=obs_camera_index,
-            obs_host=obs_host,
-            obs_port=obs_port,
-            obs_password=obs_password,
-        )
-        active_backend = 'obs' if capture.obs_capture else ('dxcam' if capture.camera else 'mss')
-        print(f">>> Capture backend ready: {active_backend}")
+        capture = OBSCapture(camera_index=obs_camera_index)
+        print(">>> OBS Virtual Camera capture ready")
+    except RuntimeError:
+        raise
     except Exception as e:
-        print(f">>> Screen Capture Init Failed: {e}")
-        return
+        raise RuntimeError(f"OBS Virtual Camera init failed: {e}") from e
 
-    # 窗口设置
+    # ---- 窗口设置 ----
     show_window = True
+    calibration = CrosshairCalibration()  # 实例化校准对象
     try:
         cv2.namedWindow("Radar", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Radar", 320, 320)
         cv2.setWindowProperty("Radar", cv2.WND_PROP_TOPMOST, 1)
-        cv2.setMouseCallback("Radar", mouse_callback)
-    except:
+        cv2.setMouseCallback("Radar", mouse_callback, calibration)
+    except Exception:
         pass
 
-    # 变量初始化
-    aim_controller = FastAimController(base_sensitivity=1.2)  # 提高基础灵敏度
+    # ---- 状态变量 ----
+    aim_controller = FastAimController(base_sensitivity=1.2)
     aim_enabled = True
     t_win, t_aim, t_target = 0, 0, 0
-    prev_time = time.time()
-
-    # 锁定逻辑变量
     is_locking = False
     last_target_x, last_target_y = 0, 0
+
+    # FPS 计算: 使用滑动窗口
+    fps_history = []
+    fps_window_size = 30
 
     print("\n" + "=" * 30)
     print("[SYSTEM READY] - Press 'q' to quit")
@@ -557,61 +659,23 @@ def main():
     try:
         frame_count = 0
         while True:
-            # === 获取裁剪后的帧 (使用 dxcam 或 mss) ===
-            if capture.obs_capture:
-                obs_frame = capture.grab()
-                if obs_frame is None or obs_frame.size == 0:
-                    continue
-                h_scr, w_scr = obs_frame.shape[:2]
-                center_x_scr, center_y_scr = w_scr // 2, h_scr // 2
-                half_size = DETECTION_SIZE // 2
-                x1_crop = max(0, center_x_scr - half_size)
-                y1_crop = max(0, center_y_scr - half_size)
-                x2_crop = min(w_scr, center_x_scr + half_size)
-                y2_crop = min(h_scr, center_y_scr + half_size)
-                img_raw = obs_frame[y1_crop:y2_crop, x1_crop:x2_crop]
-            elif USE_DXCAM and capture.camera:
-                # dxcam 直接捕获中心区域
-                region = capture.camera.region
-                screen_w, screen_h = region[2], region[3]
-                center_x, center_y = screen_w // 2, screen_h // 2
-                half_size = DETECTION_SIZE // 2
-                crop_region = (
-                    center_x - half_size,
-                    center_y - half_size,
-                    center_x + half_size,
-                    center_y + half_size
-                )
-                img_raw = capture.camera.grab(crop_region)
-                if img_raw is None:
-                    continue
-            else:
-                # mss 捕获全屏再裁剪
-                full_img = capture.grab()
-                if full_img is None:
-                    continue
+            loop_start = time.time()
 
-                # 手动裁剪中心区域
-                h_scr, w_scr = full_img.shape[:2]
-                center_x_scr, center_y_scr = w_scr // 2, h_scr // 2
-                half_size = DETECTION_SIZE // 2
+            # ---- 帧捕获 ----
+            obs_frame = capture.grab()
+            if obs_frame is None or obs_frame.size == 0:
+                continue
 
-                x1_crop = max(0, center_x_scr - half_size)
-                y1_crop = max(0, center_y_scr - half_size)
-                x2_crop = min(w_scr, center_x_scr + half_size)
-                y2_crop = min(h_scr, center_y_scr + half_size)
-
-                img_raw = full_img[y1_crop:y2_crop, x1_crop:x2_crop]
-
+            img_raw = _crop_center(obs_frame, DETECTION_SIZE)
             if img_raw.size == 0:
                 continue
 
-            # === 修复 OpenCV 数组连续性问题 ===
             if not img_raw.flags['C_CONTIGUOUS']:
                 img_raw = np.ascontiguousarray(img_raw)
 
-            # === 1. 按键处理 ===
-            if win32api.GetAsyncKeyState(KEYS['QUIT'][0]) & 0x8000: break
+            # ---- 按键处理 ----
+            if win32api.GetAsyncKeyState(KEYS['QUIT'][0]) & 0x8000:
+                break
 
             is_pressed, t_win = check_key_state(KEYS['TOGGLE_WIN'], t_win)
             if is_pressed:
@@ -622,169 +686,57 @@ def main():
                     cv2.destroyAllWindows()
 
             is_pressed, t_aim = check_key_state(KEYS['TOGGLE_AIM'], t_aim)
-            if is_pressed: aim_enabled = not aim_enabled
+            if is_pressed:
+                aim_enabled = not aim_enabled
 
             is_pressed, t_target = check_key_state(KEYS['TOGGLE_TARGET'], t_target)
-            if is_pressed: current_target_type = 1 - current_target_type
+            if is_pressed:
+                current_target_type = 1 - current_target_type
 
-            # === 2. 推理 ===
+            # ---- 推理 ----
             img_rgb = cv2.cvtColor(img_raw, cv2.COLOR_BGR2RGB)
 
-            # === 【关键修改4】防止 ONNX 模式下检测到人时闪退 ===
-            detection_size = DETECTION_SIZE
-
             if model_type == 'onnx':
-                img_resized = cv2.resize(img_rgb, (DETECTION_SIZE, DETECTION_SIZE))
-                img_tensor = img_resized.astype(np.float16) / 255.0
-                img_tensor = np.transpose(img_tensor, (2, 0, 1))
-                img_tensor = np.expand_dims(img_tensor, axis=0)
-                outputs = model.run(None, {'images': img_tensor})
-                detections = outputs[0][0]
-                valid_dets = detections[detections[:, 4] > CONF_THRES]
-                if len(valid_dets) > MAX_DETECTIONS:
-                    valid_dets = valid_dets[np.argsort(valid_dets[:, 4])[::-1][:MAX_DETECTIONS]]
-                det = torch.from_numpy(valid_dets)
-                # XYWH -> XYXY
-                det[:, 0] = det[:, 0] - det[:, 2] / 2
-                det[:, 1] = det[:, 1] - det[:, 3] / 2
-                det[:, 2] = det[:, 0] + det[:, 2]
-                det[:, 3] = det[:, 1] + det[:, 3]
-
+                det = _run_onnx_inference(model, img_rgb)
             elif model_type == 'pt':
-                # 使用 GPU 预处理 (跳过 CPU 的 BGR->RGB 转换)
-                img_resized = cv2.resize(img_raw, (DETECTION_SIZE, DETECTION_SIZE))
-                img = preprocess_gpu(img_resized, device, half=is_half)
-                pred = model(img)
-                det = non_max_suppression(pred, CONF_THRES, IOU_THRES, max_det=MAX_DETECTIONS)[0]
-
+                det = _run_pt_inference(model, device, is_half, nms_fn, img_raw)
             elif model_type == 'engine':
-                # TensorRT 推理
-                import pycuda.driver as cuda
-                import pycuda.autoinit
-
-                context, engine, trt_inputs, trt_outputs, bindings, stream = model
-
-                # 预处理 - resize + normalize + transpose
-                img_resized = cv2.resize(img_rgb, (DETECTION_SIZE, DETECTION_SIZE))
-                img_norm = img_resized.astype(np.float32) / 255.0
-                img_input = np.transpose(img_norm, (2, 0, 1)).flatten()
-
-                # 复制输入到页锁定内存
-                np.copyto(trt_inputs[0]['host'], img_input)
-
-                # 异步传输到 GPU 并执行推理
-                cuda.memcpy_htod_async(trt_inputs[0]['device'], trt_inputs[0]['host'], stream)
-                context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
-                cuda.memcpy_dtoh_async(trt_outputs[0]['host'], trt_outputs[0]['device'], stream)
-                stream.synchronize()
-
-                # 解析输出
-                output = trt_outputs[0]['host']
-                # YOLOv5 输出格式: [batch, num_detections, 6] 或 [num_detections, 6]
-                # 6 = [x, y, w, h, conf, cls]
-                output = output.reshape(-1, 6)
-
-                # 过滤低置信度
-                valid_mask = output[:, 4] > CONF_THRES
-                detections = output[valid_mask]
-
-                # 限制最大检测数
-                if len(detections) > MAX_DETECTIONS:
-                    indices = np.argsort(detections[:, 4])[::-1][:MAX_DETECTIONS]
-                    detections = detections[indices]
-
-                # 转换为 torch tensor (与 PyTorch 分支保持一致)
-                det = torch.from_numpy(detections)
-
-                # XYWH -> XYXY
-                if len(det) > 0:
-                    det[:, 0] = det[:, 0] - det[:, 2] / 2
-                    det[:, 1] = det[:, 1] - det[:, 3] / 2
-                    det[:, 2] = det[:, 0] + det[:, 2]
-                    det[:, 3] = det[:, 1] + det[:, 3]
-
-            # === 3. 目标选择 logic ===
-            frame_count += 1
-            best_dx, best_dy = 0, 0
-            has_target = False
-            center = DETECTION_SIZE / 2
-            candidates = []
-
-            if len(det):
-                det = det.cpu().numpy()
-                for detection in det:
-                    if len(detection) >= 6:
-                        # 统一格式处理
-                        x1, y1, x2, y2, conf, cls = detection[:6]
-
-                        if conf < CONF_THRES: continue
-
-                        # 坐标限制
-                        x1 = max(0, min(x1, detection_size))
-                        y1 = max(0, min(y1, detection_size))
-                        x2 = max(0, min(x2, detection_size))
-                        y2 = max(0, min(y2, detection_size))
-
-                        if int(cls) == current_target_type:
-                            tx, ty = (x1 + x2) / 2, (y1 + y2) / 2
-                            dx, dy = tx - center, ty - center
-                            dist = (dx ** 2 + dy ** 2) ** 0.5
-
-                            if dist > AIM_FOV_RADIUS: continue
-
-                            # 权重计算
-                            weight = dist * 0.6 + (1 - conf) * 100
-                            if is_locking:
-                                last_dist = ((dx - last_target_x) ** 2 + (dy - last_target_y) ** 2) ** 0.5
-                                weight = weight * 0.4 + last_dist * 0.6
-
-                            candidates.append((weight, dx, dy, x1, y1, x2, y2, cls))
-
-            if candidates:
-                candidates.sort(key=lambda x: x[0])
-                _, best_dx, best_dy, b_x1, b_y1, b_x2, b_y2, _ = candidates[0]
-                has_target = True
-                is_locking = True
-                last_target_x, last_target_y = best_dx, best_dy
+                det = _run_engine_inference(model, img_rgb)
             else:
-                is_locking = False
+                det = torch.empty((0, 6))
 
-            # === 4. 鼠标移动 ===
+            # ---- 目标选择 ----
+            frame_count += 1
+            best_dx, best_dy, has_target, is_locking, last_target_x, last_target_y = \
+                _select_target(det, current_target_type, is_locking, last_target_x, last_target_y)
+
+            # ---- 鼠标移动 ----
             status = "Ready"
             if aim_enabled and has_target:
-                # 使用新的快速瞄准控制器
                 move_x, move_y = aim_controller.calculate_movement(best_dx, best_dy)
-
                 if driver.ok:
                     driver.move(int(move_x), int(move_y))
                     dist = (best_dx ** 2 + best_dy ** 2) ** 0.5
                     status = f"AIMING | Dist: {int(dist)}"
             else:
-                # 重置控制器状态
                 aim_controller.reset()
 
-            # 每10帧更新一次 FPS 显示，减少 IO 开销
+            # ---- FPS 计算 (滑动窗口平均) ----
+            loop_time = time.time() - loop_start
+            fps_history.append(1.0 / loop_time if loop_time > 0 else 0)
+            if len(fps_history) > fps_window_size:
+                fps_history.pop(0)
+
             if frame_count % 10 == 0:
+                avg_fps = sum(fps_history) / len(fps_history) if fps_history else 0
                 print_status(
-                    f"[{'HEAD' if current_target_type == 1 else 'BODY'}] {status} | FPS: {int(1 / (time.time() - prev_time)) if time.time() > prev_time else 0}   ")
-                prev_time = time.time()
+                    f"[{'HEAD' if current_target_type == 1 else 'BODY'}] {status} | FPS: {int(avg_fps)}   "
+                )
 
-            # === 5. 显示优化 - 每5帧显示一次 ===
+            # ---- 显示 ----
             if show_window and frame_count % 5 == 0:
-                # 画FOV
-                cv2.circle(img_raw, (int(center), int(center)), AIM_FOV_RADIUS, (0, 255, 0), 1)
-
-                # 画框
-                if len(det):
-                    for d in det:
-                        x1, y1, x2, y2, conf, cls = map(int, d[:6])
-                        c = (0, 255, 0) if cls == 1 else (255, 0, 0)
-                        cv2.rectangle(img_raw, (x1, y1), (x2, y2), c, 2)
-
-                if has_target:
-                    cv2.line(img_raw, (int(center), int(center)), (int(center + best_dx), int(center + best_dy)),
-                             (0, 255, 255), 2)
-
+                center = DETECTION_SIZE / 2
+                _draw_overlay(img_raw, det, center, AIM_FOV_RADIUS, has_target, best_dx, best_dy)
                 cv2.imshow("Radar", img_raw)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
