@@ -1,11 +1,19 @@
-# YOLOv5 FPS 自动瞄准系统
+# YOLOv5 FPS Auto-Aim System
 
-一个基于 YOLOv5 的实时 FPS 游戏自动瞄准工具，支持游戏如 CS2、VALORANT 等。
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)]()
+
+A real-time FPS game auto-aim tool based on YOLOv5. Supports TensorRT / ONNX / PyTorch backends, OBS Virtual Camera input, and Logitech mouse control.
+
+> English · [中文说明](#-功能说明)
+
+**Disclaimer:** This project is for educational and research purposes only. Using this tool may violate game ToS and result in account bans. Use at your own risk.
 
 ## 📋 目录
 
 - [功能说明](#-功能说明)
-- [文件说明](#-文件说明)
+- [项目文件](#-项目文件)
 - [环境要求](#-环境要求)
 - [快速开始](#-快速开始)
 - [按键说明](#-按键说明)
@@ -16,44 +24,52 @@
 
 ## 🎯 功能说明
 
-- ✅ 实时屏幕捕获（DXCam）
-- ✅ YOLOv5 目标检测（支持 .engine/.onnx/.pt 模型）
-- ✅ 智能瞄准控制（支持头/身体切换）
-- ✅ 罗技鼠标驱动（支持 Logitech G 系列鼠标）
-- ✅ 可视化界面（Radar 窗口）
-- ✅ 高 DPI 适配
+- ✅ 实时屏幕捕获 — OBS Virtual Camera（主力）/ DXCam / MSS 多后端
+- ✅ YOLOv5 目标检测 — TensorRT (.engine) / ONNX (.onnx) / PyTorch (.pt) 自动回退
+- ✅ 智能瞄准控制 — 连续灵敏度曲线 + 自适应平滑滤波，支持头/身体切换
+- ✅ 罗技鼠标驱动 — Logitech G 系列（DLL 驱动）/ GHUB 替代方案（SendInput 模拟）
+- ✅ 可视化窗口 — Radar 实时检测画框 + FOV 圈 + 瞄准线
+- ✅ 高 DPI 适配 + 管理员权限自动提升
+- ✅ 命令行 + GUI 双版本
 
 ---
 
-## 📁 文件说明
+## 📁 项目文件
 
-### 必需文件
-
-| 文件名 | 说明 | 大小 |
-|--------|------|------|
-| `main_aim.py` | 主程序入口 | ~17 KB |
-| `1225_2best.engine` | TensorRT 推理引擎（推荐） | ~17 MB |
-| `1225_2best.onnx` | ONNX 模型（备用） | ~14 MB |
-| `1225_2best.pt` | PyTorch 模型（备用） | ~14 MB |
-| `logitech.py` | 罗技鼠标驱动 | ~2 KB |
-| `logitech.driver.dll` | 罗技驱动 DLL | ~37 KB |
-| `data.yaml` | 数据集配置 | ~520 B |
-
-### 可选文件
+### 核心脚本
 
 | 文件名 | 说明 |
 |--------|------|
-| `ghub_replacement.py` | GHubs 替代方案（备用驱动） |
-| `my.yaml` | 自用配置文件（项目内部使用） |
+| `main_aim.py` | **主程序入口（推荐）** — 命令行版，OBS 优先，代码干净修复版 |
+| `main_aim_gui.py` | GUI 版本 — 带图形操作界面，DXCam/MSS 后端 |
+| `main_aim_optimized.py` | 优化版 v2.0 — 多线程异步捕获 + CUDA NMS，RTX 4060 60+ FPS |
+| `build_engine.py` | TensorRT 引擎构建工具 — ONNX → .engine 转换 |
+| `test_main_aim_runtime.py` | 运行时测试 — pytest 验证主流程参数传递 |
 
-### 输出目录
+### 模型文件
 
-```
-runs/
-├── train/           # 训练结果（如果重新训练）
-├── detect/          # 检测结果（如果使用 detect.py）
-└── exp*/            # 各次训练的实验记录
-```
+| 文件名 | 说明 | 大小 |
+|--------|------|------|
+| `1225_2best.engine` | TensorRT 推理引擎（推荐，FP16） | ~17 MB |
+| `1225_2best_v10.engine` | TensorRT 10.x 引擎（备用） | ~17 MB |
+| `1225_2best.onnx` | ONNX 模型（CPU 回退） | ~14 MB |
+| `1225_2best.pt` | PyTorch 权重（训练/微调用） | ~14 MB |
+
+### 鼠标驱动
+
+| 文件名 | 说明 |
+|--------|------|
+| `logitech.py` | 罗技 DLL 驱动封装（主力） |
+| `logitech.driver.dll` | 罗技驱动 DLL (GHUB 依赖) |
+| `ghub_replacement.py` | GHUB 替代方案 — 纯 SendInput 模拟，无需罗技驱动 |
+
+### 配置文件
+
+| 文件名 | 说明 |
+|--------|------|
+| `data.yaml` | YOLOv5 训练数据集配置（body/head 两类） |
+| `my.yaml` | 本地数据处理配置（与本项目自瞄无关） |
+| `.gitignore` | Git 忽略规则 |
 
 ---
 
@@ -87,56 +103,35 @@ pycuda>=2022.2             # 可选，TensorRT 推理用
 ### 第一步：安装依赖
 
 ```bash
-pip install torch numpy opencv-python dxcam matplotlib pywin32
+pip install torch numpy opencv-python dxcam matplotlib pywin32 onnxruntime pytest
 ```
 
-如需 ONNX 支持：
-```bash
-pip install onnxruntime-gpu
-```
-
-如需 TensorRT 支持：
+如需 TensorRT 支持（推荐，速度最快）：
 ```bash
 pip install tensorrt pycuda
 ```
 
-### 第二步：运行程序
+### 第二步：启动 OBS Virtual Camera
 
-1. **以管理员身份运行**：
-   - 右键点击 `main_aim.py`
-   - 选择"以管理员身份运行"
+本系统通过 OBS Virtual Camera 获取游戏画面：
+1. 打开 OBS Studio
+2. 添加游戏源（Game Capture / Window Capture）
+3. 点击「启动虚拟摄像机」
 
-2. **或使用命令行**：
-   ```bash
-   python main_aim.py
-   ```
+### 第三步：运行程序
 
-### 使用 OBS 作为画面输入
+以**管理员身份**运行（鼠标驱动需要系统级权限）：
 
-`main_aim.py` 现在支持通过 OBS 作为屏幕/帧输入源。
-
-推荐方式：
-- 优先使用 OBS Virtual Camera
-- 若虚拟摄像头不可用，则回退到 obs-websocket 截图接口
-
-Windows 命令行示例：
-```bat
-set CAPTURE_BACKEND=obs
-set OBS_CAMERA_INDEX=0
-set OBS_SOURCE_NAME=你的OBS源名称
-set OBS_HOST=127.0.0.1
-set OBS_PORT=4455
+```bash
 python main_aim.py
 ```
 
-说明：
-- `CAPTURE_BACKEND=obs` 时启用 OBS 输入。
-- 若能打开 OBS Virtual Camera，脚本会直接读取虚拟摄像头画面。
-- 若虚拟摄像头不可用，会尝试连接 obs-websocket 并抓取截图。
-- 当前 obs-websocket 模式仅支持未启用认证的连接；如开启了认证，需要后续补充鉴权逻辑。
-- WSL 中只能做静态/语法验证，实际 OBS 采集与鼠标联动仍需在 Windows + OBS 环境中验证。
+可选：指定摄像头索引
+```bash
+python main_aim.py --obs-camera-index 0
+```
 
-### 第三步：检查状态
+### 第四步：检查状态
 
 启动后会显示：
 ```
@@ -158,53 +153,49 @@ python main_aim.py
 
 ---
 
-## ⚙️ OBS 捕获模式
+## ⚙️ OBS 捕获模式（高级）
 
-如果你想改成由 OBS 提供画面，而不是直接走 DXCam/MSS，可以在启动前设置环境变量：
+当前 `main_aim.py` 默认使用 OBS Virtual Camera 作为输入。如需调整摄像头索引：
 
 ```bash
-set CAPTURE_BACKEND=obs
+# 命令行参数
+python main_aim.py --obs-camera-index 0
+
+# 或环境变量
 set OBS_CAMERA_INDEX=0
-set OBS_SOURCE_NAME=
-set OBS_HOST=127.0.0.1
-set OBS_PORT=4455
-set OBS_PASSWORD=
 python main_aim.py
 ```
 
-说明：
-- 优先尝试 `OBS Virtual Camera`
-- 如果虚拟摄像头打不开，会回退到 `obs-websocket` 截图接口
-- `OBS_SOURCE_NAME` 留空时，使用 OBS program output 截图；如果要抓某个源，填入源名称
-- 当前代码要求 OBS websocket 不启用密码认证；如果启用了密码，程序会明确报错
-- 首次建议先在 OBS 中确认：
-  1. 已启动 Virtual Camera，或
-  2. 已启用 obs-websocket v5，端口与脚本一致
+GUI 版 (`main_aim_gui.py`) 和优化版 (`main_aim_optimized.py`) 使用 DXCam (DXGI 硬件捕获)，不依赖 OBS。
 
 ---
 
 ## ⚙️ 参数配置
 
-在 `main_aim.py` 的顶部修改参数：
+在 `main_aim.py` 顶部修改：
 
 ```python
-# ================== ⚡ 参数设置区 ⚡ ==================
-DETECTION_SIZE = 320          # 检测尺寸 (320 或 640)
-DXCAM_MAX_FPS = 144           # 最大帧率 (防止 CPU 过高)
-CONF_THRES = 0.5              # 置信度阈值 (0.0 - 1.0)
-IOU_THRES = 0.45              # IoU 阈值 (0.0 - 1.0)
-MAX_DETECTIONS = 20           # 最大检测数量
-AIM_FOV_RADIUS = 300          # 自瞄准 FOV 半径 (像素)
-# ========================================================
+# ---- 模型/检测参数 ----
+DETECTION_SIZE = 320       # 检测尺寸 (320 或 640)
+CONF_THRES = 0.5           # 置信度阈值 (0.0 - 1.0)
+IOU_THRES = 0.45           # NMS IOU 阈值
+MAX_DETECTIONS = 20        # 最大检测数
+AIM_FOV_RADIUS = 300       # 自瞄 FOV 半径 (像素)
+
+# ---- 性能参数 ----
+DXCAM_MAX_FPS = 144        # 目标最大 FPS
+BATCH_SIZE = 1             # 批量推理 (1=实时)
+BATCH_MAX_LATENCY_MS = 8   # 批量最大等待时间 (毫秒)
 ```
 
-### 参数说明
+### 关键参数说明
 
 | 参数 | 推荐值 | 说明 |
 |------|--------|------|
-| DETECTION_SIZE | 320 | 小尺寸速度快，640 精度高 |
+| DETECTION_SIZE | 320 | 小尺寸速度快，640 精度高（需模型匹配） |
 | CONF_THRES | 0.5-0.7 | 阈值越高，误检越少 |
-| AIM_FOV_RADIUS | 250-400 | 自动瞄准范围 |
+| AIM_FOV_RADIUS | 250-400 | 自瞄范围（像素），越大越容易误锁 |
+| DXCAM_MAX_FPS | 144 | 目标帧率上限，降低可减少 CPU 占用 |
 
 ---
 
