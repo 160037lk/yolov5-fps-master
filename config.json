@@ -1,0 +1,76 @@
+{
+    "basic": {
+        "conf_threshold": 0.5,
+        "weights_path": "1225_2best.engine",
+        "first_part": 1,
+        "include_head": true,
+        "first_team": 0,
+        "mouse_move_method": "logitech",
+        "inference_method": 0,
+        "cpu_threads": 4,
+        "half_precision": true,
+        "gpu_index": 0,
+        "screenshot_mode": "window"
+    },
+    "global_movement": {
+        "game_sensitivity": 1.0,
+        "mouse_single_movement_distance": 1,
+        "movement_shake_degree": 0.3,
+        "maximum_lead": 50,
+        "lead_gear": 1,
+        "game_fov_value": 90,
+        "game_rotation_pixel_count": 3000,
+        "rotation_measurement_sensitivity": 1.0
+    },
+    "rifle": {
+        "delay_compensation_time_ms": 0,
+        "aim_key": 164,
+        "aim_key2": 165,
+        "aim_mode": "move_constant",
+        "capture_key": 160,
+        "automatic_fire_interval_ms": 100,
+        "automatic_fire_judgment_range": 0.3,
+        "aim_pixel_range": 55,
+        "aim_position_upper_limit": 2.0,
+        "aim_position_lower_limit": 4.0,
+        "aim_position_horizontal_limit": 0.0,
+        "static_aim_speed": 0.5,
+        "movement_tracking_speed": 0.015
+    },
+    "sniper": {
+        "delay_compensation_time_ms": 0,
+        "aim_key": 164,
+        "aim_mode": "move_once",
+        "trigger_enabled": true,
+        "automatic_fire_delay_ms": 200,
+        "automatic_fire_interval_ms": 800,
+        "automatic_fire_judgment_range": 0.2,
+        "aim_pixel_range": 80,
+        "aim_position_upper_limit": 2.0,
+        "aim_position_lower_limit": 2.0,
+        "static_aim_speed": 0.5,
+        "movement_tracking_speed": 0.015
+    },
+    "gun_control": {
+        "aim_key": 160,
+        "weapon_icon_recognition_mode": "auto_detect",
+        "weapon_icon_path": "",
+        "weapon_csv_path": "recoil_data/",
+        "weapon_icon_detection_color_limit_up": [255, 255, 255],
+        "weapon_icon_detection_color_limit_down": [0, 0, 0],
+        "normal_gun_control_value": 1.0,
+        "recoil_offset": 1.0
+    },
+    "hotkeys": {
+        "TOGGLE_AIM": 167,
+        "TOGGLE_TARGET": 166,
+        "TOGGLE_WIN": 192,
+        "QUIT": 81,
+        "SWITCH_WEAPON_MODE": 70
+    },
+    "display": {
+        "detection_window_enabled": true,
+        "detection_size": 320,
+        "max_fps": 144
+    }
+}
