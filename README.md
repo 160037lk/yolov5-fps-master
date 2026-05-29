@@ -1,10 +1,10 @@
-# OBS Auto Aim — 云端 GPU 推理目标检测系统
+# CloudVision — 分布式 GPU 实时视觉感知研究框架
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)]()
 
-基于计算机视觉与深度学习的云端 GPU 实时目标检测与追踪研究系统。
+基于云边协同架构的实时目标检测、多模型集成推理与人机交互行为模拟研究平台。
 
 ---
 
